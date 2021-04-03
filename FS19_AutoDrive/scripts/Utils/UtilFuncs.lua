@@ -709,6 +709,11 @@ function AutoDrive:getIsActivatable(superFunc, objectToFill)
 end
 
 function AutoDrive:zoomSmoothly(superFunc, offset)
+	-- if smooth curve preview is active, use mousewheel to increase and decrease smoothness and prevent zooming
+	if AutoDrive.experimentalFeatures.smoothWaypointConnection and ADGraphManager.curvePreview and AutoDrive.leftLSHIFTmodifierKeyPressed then
+		ADGraphManager:recalculatePreview(offset / 3)
+		return
+	end
 	if not AutoDrive.mouseWheelActive then -- don't zoom camera when mouse wheel is used to scroll targets (thanks to sperrgebiet)
 		superFunc(self, offset)
 	end
@@ -960,6 +965,79 @@ function AutoDrive.checkWaypointsMultipleSameOut(correctit)
 	if count > 0 then
 		AutoDrive.debugPrint(nil, AutoDrive.DC_ROADNETWORKINFO, "[AD] removed %s waypoint with multiple same out links", tostring(count))
 	end
+end
+
+ADVectorUtils = {}
+
+--- Calculates the unit vector on a given vector.
+--- @param vector table Table with x and z properties.
+--- @return table Unitvector as table with x and z properties.
+function ADVectorUtils.unitVector2D(vector)
+	local x, z = vector.x or 0, vector.z or 0
+	local q = math.sqrt( (x * x) + ( z * z ) )
+	return {x = x / q, z = z / q}
+end
+
+--- Scales a vector by a given scalar.
+--- @param vector table Table with x and z properties. 
+--- @param scale number Scale
+--- @return table Vector
+function ADVectorUtils.scaleVector2D(vector, scale)
+	scale = scale or 1.0
+	vector.x = ( vector.x * scale ) or 0
+	vector.z = ( vector.z * scale ) or 0
+	return vector
+end
+
+--- Returns the distance between zwo vectors using their x and z coordinates.
+--- @param vectorA table with x and z property
+--- @param vectorB table with x and z property
+--- @return number Distance between vectorA and vectorB
+function ADVectorUtils.distance2D(vectorA, vectorB)
+	return MathUtil.vector2Length(vectorA.x - vectorB.x, vectorA.z - vectorB.z)
+end
+
+--- Returns a new vector pointing from vectorA to vectorB by subtracting A from B
+--- @param vectorA table with x and z property
+--- @param vectorB table with x and z property
+--- @return table Vector pointing from A to B
+function ADVectorUtils.subtract2D(vectorA, vectorB)
+	return {x = vectorB.x - vectorA.x, z = vectorB.z - vectorA.z}
+end
+
+--- Inverts a vector with x and z properties. 
+--- @param vector table with x and z property
+--- @return table Vector inverted
+function ADVectorUtils.invert2D(vector)
+	vector.x = vector.x * -1
+	vector.z = vector.z * -1
+	return vector
+end
+
+--- Adds x and z values of two given vectors and returns a new vector with x and z properties.
+--- @param vectorA table with x and z property
+--- @param vectorB table with x and z property
+--- @return table Vector
+function ADVectorUtils.add2D(vectorA, vectorB)
+	return {x = vectorA.x + vectorB.x, z = vectorA.z + vectorB.z}
+end
+
+--- Does a linear interpolation based on the in* range and value, and returns a new value
+--- fitting in the out range. Second return value is the interpolated value between 0..1.
+--- @param inMin number Minimum value for input range
+--- @param inMax number Maximum number for input range
+--- @param inValue number Current value for input range
+--- @param outMin number Minimum value vor output range
+--- @param outMax number Maximum value for output range
+--- @return number, number Interpolated value in output range, value in range 0..1
+function ADVectorUtils.linterp(inMin, inMax, inValue, outMin, outMax)
+	-- normalize input, make min range boundary = 0, nval is between 0..1
+	local imax = inMax - inMin
+	local nval = math.clamp(0, inValue - inMin, imax) / imax
+	-- normalize output
+	local omax = outMax - outMin
+	local oval = outMin + ( omax * nval )
+	return oval, nval
 end
 
 -- TODO: Maybe we should add a console command that allows to run console commands to server

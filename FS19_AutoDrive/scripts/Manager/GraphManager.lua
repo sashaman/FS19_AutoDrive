@@ -7,6 +7,7 @@ function ADGraphManager:load()
 	self.groups["All"] = 1
 	self.changes = false
 	self.preparedWayPoints = false
+	self.curvePreview = nil
 end
 
 function ADGraphManager:markChanges()
@@ -514,15 +515,237 @@ function ADGraphManager:toggleConnectionBetween(startNode, endNode, reverseDirec
 			table.removeValue(startNode.out, endNode.id)
 			table.removeValue(endNode.incoming, startNode.id)
 		else
-			table.insert(startNode.out, endNode.id)
-			if not reverseDirection then
-				table.insert(endNode.incoming, startNode.id)
+			-- if there is an active preview between startNode and endNode use this to create new WPs - otherwise just create a straight line
+			if AutoDrive.experimentalFeatures.smoothWaypointConnection and
+			   self.curvePreview ~= nil and startNode == self.curvePreview.startNode and endNode == self.curvePreview.endNode then
+
+				-- if there are only 2 WP in the preview - just create a straight line as before
+				if #self.curvePreview.waypoints == 2 then
+					table.insert(startNode.out, endNode.id)
+					if not reverseDirection then
+						table.insert(endNode.incoming, startNode.id)
+					end
+					self:markChanges()
+					return
+				end
+
+				local aWP = startNode
+				local bWP = nil
+
+				-- ommit start and endnode in the list
+				for i = 2, #self.curvePreview.waypoints - 1 do
+					local p = self.curvePreview.waypoints[i]
+					self:createWayPoint(p.x, p.y, p.z)
+					-- HACK: we assume that we created the last WP here, ignoring MP and parallel events... :(
+					bWP = self:getWayPointById(self:getWayPointsCount())
+
+					ADGraphManager:toggleConnectionBetween(aWP, bWP, false)
+					aWP, bWP = bWP, nil
+				end
+				-- connect last new WP with end node
+				ADGraphManager:toggleConnectionBetween(aWP, endNode, false)
+			else
+				-- original behaviour - just create a straight line
+				table.insert(startNode.out, endNode.id)
+				if not reverseDirection then
+					table.insert(endNode.incoming, startNode.id)
+				end
 			end
 		end
 
 		self:markChanges()
 	end
 end
+
+--- Checks if a given node is part of the current preview.
+--- Will be used to decide if the preview need to be refreshed, e.g. if the node has been moved.
+--- @param nodeId integer Id of the node to check
+--- @return boolean true if the node is used in preview calculation
+function ADGraphManager:doesNodeAffectPreview(nodeId)
+	if self.curvePreview == nil then
+		return false
+	end
+	if self.curvePreview.startNode.id == nodeId or
+		self.curvePreview.endNode.id == nodeId or
+		self.curvePreview.p0.id == nodeId or
+		self.curvePreview.p3.id == nodeId then
+			return true
+	end
+	return false
+end
+
+--- Enforces a recalculation of the smooth preview, e.g. if the curvature has changed.
+--- @param curvature number Roundness of the curve. Delta that is used to increase or decrease the roundness
+function ADGraphManager:recalculatePreview(curvature)
+	if self.curvePreview == nil then
+		return
+	end
+	curvature = curvature or 0
+	-- if the curvature is already at it's min value and we still try to decrease is - fallback to a straight line
+	if curvature < 0 and self.curvePreview.curvature <= self.curvePreview.MIN_CURVATURE then
+		self.curvePreview.curvature = -1
+	else
+		self.curvePreview.curvature = math.clamp(
+			self.curvePreview.MIN_CURVATURE, self.curvePreview.curvature + curvature, self.curvePreview.MAX_CURVATURE
+		)
+	end
+	self:previewConnectionBetween(self.curvePreview.startNode, self.curvePreview.endNode, nil, true)
+end
+
+--- Create a smooth connection between two nodes by applying a RomCutmull smoothing algorithm.
+--- @param startNode table Node to start the curve with
+--- @param endNode table Node to end the curve at
+--- @param reverseDirection boolean If true, make a curve driving reverse
+function ADGraphManager:previewConnectionBetween(startNode, endNode, reverseDirection, reuseParams)
+	if startNode == nil or endNode == nil then
+		return
+	end
+
+	if self.curvePreview ~= nil and startNode == self.curvePreview.startNode and endNode == self.curvePreview.endNode then
+		reuseParams = true
+	end
+
+	if table.contains(startNode.out, endNode.id) or table.contains(endNode.incoming, startNode.id) then
+		-- nodes are already connected - do not create preview
+		return
+	end
+
+	-- TODO: if we have more then one inbound or outbound connections, get the avg. vector
+	if #startNode.incoming == 1 and #endNode.out == 1 then
+
+		if reuseParams == nil or reuseParams == false then
+			self.curvePreview = {
+				MIN_CURVATURE = 0.5,
+				MAX_CURVATURE = 3.5,
+				startNode = startNode,
+				p0 = nil,
+				endNode = endNode,
+				p3 = nil,
+				curvature = 1,
+				waypoints = { startNode }
+			}
+		else
+			-- fallback to straight line
+			if self.curvePreview.curvature <= 0 then
+				self.curvePreview.waypoints = { startNode, endNode }
+				return
+			end
+			self.curvePreview.waypoints = { startNode }
+		end
+
+		local p0 = nil
+		for _, px in pairs(startNode.incoming) do
+			p0 = ADGraphManager:getWayPointById(px)
+			self.curvePreview.p0 = p0
+			break
+		end
+		local p3 = nil
+		for _, px in pairs(endNode.out) do
+			p3 = ADGraphManager:getWayPointById(px)
+			self.curvePreview.p3 = p3
+			break
+		end
+
+		if reuseParams == nil or reuseParams == false then
+			-- calculate the angle between start tangent and end tangent
+			local dAngle = math.abs(AutoDrive.angleBetween(
+				ADVectorUtils.subtract2D(p0, startNode),
+				ADVectorUtils.subtract2D(endNode, p3)
+			))
+			self.curvePreview.curvature = ADVectorUtils.linterp(0, 180, dAngle, 1.5, 2.5)
+		end
+
+		-- distance from start to end, divided by two to give it more roundness...
+		local dStartEnd = ADVectorUtils.distance2D(startNode, endNode) / self.curvePreview.curvature
+
+		-- we need to normalize the length of p0-start and end-p3, otherwise their length will influence the curve
+		-- get vector from p0->start
+		local vp0Start = ADVectorUtils.subtract2D(p0, startNode)
+		-- calculate unit vector of vp0Start
+		vp0Start = ADVectorUtils.unitVector2D(vp0Start)
+		-- scale it like start->end
+		vp0Start = ADVectorUtils.scaleVector2D(vp0Start, dStartEnd)
+		-- invert it
+		vp0Start = ADVectorUtils.invert2D(vp0Start)
+		-- add it to the start Vector so that we get new p0
+		p0 = ADVectorUtils.add2D(startNode, vp0Start)
+		-- make sure p0 has a y value
+		p0.y = startNode.y
+
+		-- same for end->p3, except that we do not need to invert it, but just add it to the endNode
+		local vEndp3 = ADVectorUtils.subtract2D(endNode, p3)
+		vEndp3 = ADVectorUtils.unitVector2D(vEndp3)
+		vEndp3 = ADVectorUtils.scaleVector2D(vEndp3, dStartEnd)
+		p3  = ADVectorUtils.add2D(endNode, vEndp3)
+		p3.y = endNode.y
+
+		local prevWP = startNode
+		local prevV = ADVectorUtils.subtract2D(p0, startNode)
+		-- we're calculting a VERY smooth curve and whenever the new point on the curve has a good distance to the last one create a new waypoint
+		-- but make sure that the last point also has a good distance to the endNode
+		for i = 1, 200 do
+			local px = ADGraphManager:CatmullRomInterpolate(i, p0, startNode, endNode, p3, 200)
+			local newV = ADVectorUtils.subtract2D(prevWP, px)
+			local dAngle = math.abs(AutoDrive.angleBetween(prevV, newV))
+
+			-- only create new WP if distance to last one is > 1.5m and distance to target > 1.5m and angle to last one > 3°
+			-- or at least every 4m 
+			local distPrev = ADVectorUtils.distance2D(prevWP, px)
+			local distEnd = ADVectorUtils.distance2D(px, endNode)
+			if ( distPrev >= 1.5 and distEnd >= 1.5 and dAngle >= 3 ) or (distPrev >= 4 and distEnd >= 4) then
+				-- get height at terrain
+				px.y = AutoDrive:getTerrainHeightAtWorldPos(px.x, px.z)
+				table.insert(self.curvePreview.waypoints, px)
+				prevWP = px -- newWP
+				prevV = newV
+			end
+		end
+		table.insert(self.curvePreview.waypoints, endNode)
+
+	else -- fallback to straight line connection behaviour
+		return
+	end
+end
+
+
+function ADGraphManager:CatmullRomInterpolate(index, p0, p1, p2, p3, segments)
+	local px = {x=nil, y=nil, z=nil}
+	local x = {p0.x, p1.x, p2.x, p3.x}
+	local z = {p0.z, p1.z, p2.z, p3.z}
+	local time = {0, 1, 2, 3} -- linear at start... calculate weights over time
+	local total = 0.0
+
+	for i = 2, 4 do
+		local dx = x[i] - x[i - 1]
+		local dz = z[i] - z[i - 1]
+		-- the .9 is giving the wideness and roundness of the curve,
+		-- lower values (like .25 will be more straight, while high values like .95 will be wider and rounder)
+		total = total + math.pow(dx * dx + dz * dz, 0.95)
+		time[i] = total
+	end
+    local tstart = time[2]
+	local tend = time[3]
+	local t = tstart + (index * (tend - tstart)) / segments
+
+	local L01 = p0.x * (time[2] - t) / (time[2] - time[1]) + p1.x * (t - time[1]) / (time[2] - time[1])
+	local L12 = p1.x * (time[3] - t) / (time[3] - time[2]) + p2.x * (t - time[2]) / (time[3] - time[2])
+	local L23 = p2.x * (time[4] - t) / (time[4] - time[3]) + p3.x * (t - time[3]) / (time[4] - time[3])
+	local L012 = L01 * (time[3] - t) / (time[3] - time[1]) + L12 * (t - time[1]) / (time[3] - time[1])
+	local L123 = L12 * (time[4] - t) / (time[4] - time[2]) + L23 * (t - time[2]) / (time[4] - time[2])
+	local C12 = L012 * (time[3] - t) / (time[3] - time[2]) + L123 * (t - time[2]) / (time[3] - time[2])
+	px.x = C12
+
+	L01 = p0.z * (time[2] - t) / (time[2] - time[1]) + p1.z * (t - time[1]) / (time[2] - time[1])
+	L12 = p1.z * (time[3] - t) / (time[3] - time[2]) + p2.z * (t - time[2]) / (time[3] - time[2])
+	L23 = p2.z * (time[4] - t) / (time[4] - time[3]) + p3.z * (t - time[3]) / (time[4] - time[3])
+	L012 = L01 * (time[3] - t) / (time[3] - time[1]) + L12 * (t - time[1]) / (time[3] - time[1])
+	L123 = L12 * (time[4] - t) / (time[4] - time[2]) + L23 * (t - time[2]) / (time[4] - time[2])
+	C12 = L012 * (time[3] - t) / (time[3] - time[2]) + L123 * (t - time[2]) / (time[3] - time[2])
+	px.z = C12
+
+	return px
+end
+
 
 function ADGraphManager:createWayPoint(x, y, z, sendEvent)
 	if sendEvent == nil or sendEvent == true then
